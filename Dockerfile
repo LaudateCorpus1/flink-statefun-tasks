@@ -16,7 +16,7 @@
 
 FROM ververica/flink-statefun:2.2.0
 
-RUN mkdir -p /opt/statefun/modules/greeter
-ADD conf/module.yaml /opt/statefun/modules/greeter
+RUN mkdir -p /opt/statefun/modules/tasks
+ADD conf/module.yaml /opt/statefun/modules/tasks
 
 
