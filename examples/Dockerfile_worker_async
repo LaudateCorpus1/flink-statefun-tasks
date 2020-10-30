@@ -1,0 +1,18 @@
+FROM python:3.7-alpine
+
+RUN mkdir -p /app
+RUN mkdir -p /app/examples
+WORKDIR /app
+
+COPY requirements.txt /app
+RUN MULTIDICT_NO_EXTENSIONS=1 YARL_NO_EXTENSIONS=1 pip install -r requirements.txt
+
+COPY examples/api.py /app/examples
+COPY examples/worker_async.py /app/examples
+COPY examples/worker_async.sh /app/examples
+COPY statefun_tasks/ /app/statefun_tasks/
+
+EXPOSE 8006
+
+CMD ["sh", "examples/worker_async.sh"]
+

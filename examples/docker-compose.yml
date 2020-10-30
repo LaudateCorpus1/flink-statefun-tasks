@@ -1,0 +1,25 @@
+version: "2.1"
+services:
+  worker:
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile_worker
+    ports:
+      - "8085:8085"
+
+
+  worker_async:
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile_worker_async
+    ports:
+      - "8086:8086"
+
+
+  server:
+    build:
+      context: ..
+      dockerfile: examples/Dockerfile_server
+    ports:
+      - "8082:8082"
+
