@@ -9,7 +9,7 @@ module:
             kind: http
             type: example/worker
           spec:
-            endpoint: SYNC_WORKER_ADDRESS
+            endpoint: http://python-worker:8085/worker
             states:
               - task_request
               - task_state
@@ -22,7 +22,7 @@ module:
             kind: http
             type: example/async_worker
           spec:
-            endpoint: ASYNC_WORKER_ADDRESS
+            endpoint: http://python-worker-async:8086/async_worker
             states:
               - task_request
               - task_state
@@ -36,7 +36,7 @@ module:
             type: statefun.kafka.io/routable-protobuf-ingress
             id: example/requests
           spec:
-            address: KAFKA_BROKER_ADDRESS
+            address: kafka-broker:9092
             consumerGroupId: flink-cluster-id
             topics:
               - topic: statefun-test.requests
@@ -49,7 +49,7 @@ module:
             type: statefun.kafka.io/generic-egress
             id: example/kafka-generic-egress
           spec:
-            address: KAFKA_BROKER_ADDRESS
+            address: kafka-broker:9092
             deliverySemantic:
               type: exactly-once
               transactionTimeoutMillis: 100000

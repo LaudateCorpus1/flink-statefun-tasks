@@ -7,7 +7,7 @@ import json
 
 from .api import greeting_workflow
 
-KAFKA_BROKER = "kafka broker URI"
+KAFKA_BROKER = "kafka-broker:9092"
 
 flink_client = FlinkTasksClient(KAFKA_BROKER, topic='statefun-test.requests', reply_topic=f'statefun-test.reply.{socket.gethostname()}')
 
