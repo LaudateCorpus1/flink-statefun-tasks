@@ -10,8 +10,12 @@ tasks = FlinkTasks(default_namespace="example", default_worker_name="worker",
 
 @tasks.bind()
 def greeting_workflow(first_name, last_name):
-    return _say_hello.send(first_name, last_name).continue_with(_say_goodbye, goodbye_message="see you later!")
+    return _say_hello.send(first_name, last_name).continue_with(_add_fsharp).continue_with(_say_goodbye, goodbye_message="see you later!")
 
+@tasks.bind(content_type='application/json', namespace='fs-greeter',worker_name='fromPython')
+# @tasks.bind()
+def _add_fsharp(greeting):
+  return f'{greeting} [Python]'
 
 @tasks.bind()
 def _say_hello(first_name, last_name):
