@@ -13,7 +13,7 @@ def greeting_workflow(first_name, last_name):
     return _say_hello\
       .send(first_name, last_name)\
       .continue_with(_add_lang)\
-      .set(content_type='application/json', namespace='fs-greeter', worker_name='fromPython')\
+      .set(content_type='application/json', namespace='fs-greeter', worker_name='worker')\
       .continue_with(_say_goodbye, goodbye_message="see you later!")
 
 @tasks.bind()
