@@ -1,24 +1,23 @@
 from ._serialisation import deserialise, serialise
 from ._utils import _gen_id, _task_type_for, _to_args_and_kwargs, _is_tuple
-from ._types import _GroupEntry, TaskRetryPolicy
+from ._types import TaskRetryPolicy
 from ._pipeline import _Pipeline, PipelineBuilder
 from ._context import _TaskContext
 from ._builtins import run_pipeline
 from .messages_pb2 import TaskRequest, TaskResult, TaskException
 
 from statefun.request_reply import BatchContext
-from typing import Union, Iterable
+from typing import Union
 import logging
 import traceback as tb
 import inspect
-import ast
 import asyncio
 
 _log = logging.getLogger('FlinkTasks')
 
 
-def _to_task_exception(task_request, ex, retry=False):
-    return TaskException(
+def _create_task_exception(task_request, ex, retry=False):
+    task_exception = TaskException(
         id=_gen_id(),
         correlation_id=task_request.id,
         type=f'{task_request.type}.error',
@@ -26,6 +25,9 @@ def _to_task_exception(task_request, ex, retry=False):
         exception_message=str(ex),
         stacktrace=tb.format_exc(),
         retry=retry)
+    
+    task_exception.request_state.CopyFrom(task_request.request_state)
+    return task_exception
 
 
 class FlinkTasks(object):
@@ -163,13 +165,18 @@ class FlinkTasks(object):
         pipeline.resume(context, task_result_or_exception)
 
     def _emit_result(self, context, task_request, task_result):
-            # then either we need to reply to a caller
-            if context.get_caller_id() is not None:
-                context.pack_and_reply(task_result)
+        # either send a message to egress if reply_topic was specified
+        if task_request.HasField('reply_topic'):
+            context.pack_and_send_egress(topic=task_request.reply_topic, value=task_result)
 
-            # or we need to send some egress
-            elif task_request.reply_topic is not None and task_request.reply_topic != "":
-                context.pack_and_send_egress(topic=task_request.reply_topic, value=task_result)
+        # or call back to a particular flink function if reply_address was specified
+        elif task_request.HasField('reply_address'):
+            address, identifer = context.to_address_and_id(task_request.reply_address)
+            context.pack_and_send(address, identifer, task_result)
+
+        # or call back to our caller (if there is one)
+        if context.get_caller_id() is not None:
+            context.pack_and_reply(task_result)
 
     def _finalise_task_result(self, context, task_request, task_result):
 
@@ -190,11 +197,10 @@ class FlinkTasks(object):
             # emit the result - either by replying to caller or sending some egress
             self._emit_result(context, task_request, return_value)
 
-
     def _fail(self, context, task_request, ex):
-        task_exception = _to_task_exception(task_request, ex, retry=False)
+        task_exception = _create_task_exception(task_request, ex, retry=False)
         context.pack_and_save('task_exception', task_exception)
-        
+
         # emit the error - either by replying to caller or sending some egress
         self._emit_result(context, task_request, task_exception)
 
@@ -205,10 +211,10 @@ class _FlinkTask(object):
         self._content_type = content_type
         self._retry_policy = retry_policy
 
-        self._args = inspect.getfullargspec(fun).args
+        full_arg_spec = inspect.getfullargspec(fun)
+        self._args = full_arg_spec.args
         self._num_args = len(self._args)
-        self._explicit_return = any(
-            isinstance(node, ast.Return) for node in ast.walk(ast.parse(inspect.getsource(fun))))
+        self._accepts_varargs = full_arg_spec.varargs is not None
         self.is_async = inspect.iscoroutinefunction(fun)
 
     def run(self, context: _TaskContext, task_request: TaskRequest):
@@ -272,6 +278,7 @@ class _FlinkTask(object):
             correlation_id=task_request.id,
             type=f'{task_request.type}.result')
 
+        task_result.request_state.CopyFrom(task_request.request_state)
         serialise(task_result, fn_result, content_type=self._content_type)
 
         return pipeline, task_result, extra_args
@@ -282,10 +289,10 @@ class _FlinkTask(object):
         if self._retry_policy is not None:
             retry = any([isinstance(ex, ex_type) for ex_type in self._retry_policy.retry_for])
 
-        task_exception = _to_task_exception(task_request, ex, retry=retry)
+        task_exception = _create_task_exception(task_request, ex, retry=retry)
 
         if retry:
-            task_exception.original_request.CopyFrom(task_request)
+            task_exception.retry_request.CopyFrom(task_request)
 
         return task_exception
 
@@ -302,7 +309,7 @@ class _FlinkTask(object):
             del kwargs[arg]
 
         # pass through any extra args we might have
-        if len(args) > self._num_args:
+        if len(args) > self._num_args and not self._accepts_varargs:
             task_args = args[0: self._num_args]
             pass_through_args = args[len(task_args):]
         else:
@@ -313,13 +320,7 @@ class _FlinkTask(object):
 
     def _add_passthrough_args(self, result, pass_through_args):
         if len(pass_through_args) > 0:
-
-            if self._explicit_return:
-                return_value = result, *pass_through_args
-            else:
-                return_value = *pass_through_args,
-
-            return return_value
+            return (result, *pass_through_args)
         else:
             return result
 

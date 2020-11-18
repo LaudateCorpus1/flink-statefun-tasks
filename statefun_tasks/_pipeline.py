@@ -3,9 +3,10 @@ from ._serialisation import deserialise, deserialise_result, serialise, try_seri
 from ._types import _TaskEntry, _GroupEntry, _GroupResult
 from ._context import _TaskContext
 from .messages_pb2 import TaskRequest, TaskResult, TaskException
+from functools import partial
 
 from datetime import timedelta
-from typing import Union, Optional
+from typing import Union, Iterable
 from uuid import uuid4
 
 
@@ -138,6 +139,24 @@ class _Pipeline(object):
 
         return args
 
+    @staticmethod
+    def _emit_result(context, task_request, task_result_or_exception):
+        # either send a message to egress if reply_topic was specified
+        if task_request.HasField('reply_topic'):
+            context.pack_and_send_egress(topic=task_request.reply_topic, value=task_result_or_exception)
+
+        # or call back to a particular flink function if reply_address was specified
+        elif task_request.HasField('reply_address'):
+            address, identifer = context.to_address_and_id(task_request.reply_address)
+            context.pack_and_send(address, identifer, task_result_or_exception)
+
+        # or call back to our caller (if there is one)
+        else:
+            state = context.get_state()
+            caller_id = context.get_caller_id()
+
+            if 'caller_id' in state and state['caller_id'] != caller_id:  # don't call back to self
+                context.pack_and_send(state['address'], state['caller_id'], task_result_or_exception)
 
     def resume(self, context: _TaskContext, task_result_or_exception: Union[TaskResult, TaskException]):
         caller_id = context.get_caller_id()
@@ -228,9 +247,12 @@ class _Pipeline(object):
             delay_ms = int(delay.total_seconds() * 1000.0)
             delay = timedelta(milliseconds=delay_ms ^ retry_count)
 
-        request = task_exception.original_request
+        request = task_exception.retry_request
         destination = context.get_caller_address()
-        context.pack_and_send_after(delay, destination, task_id, request)
+        if delay:
+            context.pack_and_send_after(delay, destination, task_id, request)
+        else:
+            context.pack_and_send(destination, task_id, request)
 
         retries[task_id] = retry_count + 1
         context.update_state({'retries': retries})
@@ -239,7 +261,6 @@ class _Pipeline(object):
 
     def terminate(self, context: _TaskContext, task_result_or_exception: Union[TaskResult, TaskException]):
         task_request = context.unpack('task_request', TaskRequest)
-        reply_topic = task_request.reply_topic
 
         serialised_result_before_finally = context.get_state().get('result_before_finally')
         if isinstance(task_result_or_exception, TaskResult) and serialised_result_before_finally is not None:
@@ -248,28 +269,30 @@ class _Pipeline(object):
             serialised_result_before_finally.Unpack(result_before_finally)
             task_result_or_exception = result_before_finally
 
+        # set basic message properties
         task_result_or_exception.correlation_id = task_request.id
         task_result_or_exception.type = f'{task_request.type}.' + (
             'result' if isinstance(task_result_or_exception, TaskResult) else 'error')
 
-        if reply_topic is not None and reply_topic != "":
-            context.pack_and_send_egress(topic=reply_topic, value=task_result_or_exception)
-        else:
-            state = context.get_state()
-            caller_id = context.get_caller_id()
+        # pass back any request_state that we were given at the start of the pipeline
+        task_result_or_exception.request_state.CopyFrom(task_request.request_state)
 
-            if 'caller_id' in state and state['caller_id'] != caller_id:
-                context.pack_and_send(state['address'], state['caller_id'], task_result_or_exception)
+        # remove the retry_request if set because this is only used if we are retrying
+        if isinstance(task_result_or_exception, TaskException):
+            task_result_or_exception.ClearField('retry_request')
+
+        # finally emit the result (to egress, destination address or caller address)
+        self._emit_result(context, task_request, task_result_or_exception)
 
 
 class PipelineBuilder():
     def __init__(self, pipeline: list = None):
         self._pipeline = [] if pipeline is None else pipeline
 
-    def append_to(self, other):
+    def append_to(self, other: 'PipelineBuilder'):
         other._pipeline.extend(self._pipeline)
 
-    def append_group(self, pipelines):
+    def append_group(self, pipelines: Iterable['PipelineBuilder']):
         group = _GroupEntry(_gen_id())
 
         for pipeline in pipelines:
@@ -289,7 +312,7 @@ class PipelineBuilder():
 
     def send(self, fun, *args, **kwargs):
         task_type = _task_type_for(fun)
-        self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=fun.defaults()))
+        self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(fun)))
         return self
 
     def set(self, **kwargs):
@@ -304,7 +327,7 @@ class PipelineBuilder():
             continuation.append_to(self)
         else:
             task_type = _task_type_for(continuation)
-            self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=continuation.defaults()))
+            self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(continuation)))
         return self
 
     def is_single_task(self):
@@ -319,20 +342,23 @@ class PipelineBuilder():
             task = self._pipeline[0]
             task_id, task_type, args, kwargs = task.to_tuple()
             task_data = (args, kwargs)
+            serialiser = partial(serialise, data=task_data, content_type=task.get_parameter('content_type'))
         else:
             task_id = str(uuid4())
             task_data = ((self._pipeline,), {})
             task_type = '__builtins.run_pipeline'
+            serialiser = partial(try_serialise_json_then_pickle, data=task_data)
 
         task_request = TaskRequest(id=task_id, type=task_type)
-        try_serialise_json_then_pickle(task_request, task_data)
-
+        serialiser(task_request)
+        
         return task_request
 
     def finally_do(self, finally_action, *args, **kwargs):
         task_type = _task_type_for(finally_action)
         self._pipeline.append(
-            _TaskEntry(_gen_id(), task_type, args, kwargs, parameters=finally_action.defaults(), is_finally=True))
+            _TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(finally_action),
+                       is_finally=True))
         return self
 
     def to_pipeline(self):
@@ -347,3 +373,10 @@ class PipelineBuilder():
             return 'Cannot have more than one "finally_do" method.'
         if len(finally_tasks) == 1 and finally_tasks[0] != self._pipeline[-1]:
             return 'finally_do must be called at the end of a pipeline'
+
+    @staticmethod
+    def _get_defaults(fun):
+        try:
+            return fun.defaults()
+        except AttributeError:
+            raise AttributeError(f'Function {fun.__module__}.{fun.__name__} should be decorated with tasks.bind')
