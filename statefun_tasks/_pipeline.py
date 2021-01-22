@@ -213,8 +213,8 @@ class PipelineBuilder():
         group.add_to_group(self._pipeline)
 
     def send(self, fun, *args, **kwargs):
-        task_type = _task_type_for(fun)
-        self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(fun)))
+        task_type, parameters = self._task_type_and_parameters_for(fun)
+        self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=parameters))
         return self
 
     def set(self, **kwargs):
@@ -228,8 +228,8 @@ class PipelineBuilder():
         if isinstance(continuation, PipelineBuilder):
             continuation.append_to(self)
         else:
-            task_type = _task_type_for(continuation)
-            self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(continuation)))
+            task_type, parameters = self._task_type_and_parameters_for(continuation)
+            self._pipeline.append(_TaskEntry(_gen_id(), task_type, args, kwargs, parameters=parameters))
         return self
 
     def is_single_task(self):
@@ -246,7 +246,7 @@ class PipelineBuilder():
         else:
             task_id = str(uuid4())
             task_type = '__builtins.run_pipeline'
-            args = self.to_pipeline().to_proto()
+            args = self.validate().to_pipeline().to_proto()
             kwargs = {}
 
         # send a single argument by itself instead of wrapped inside a tuple
@@ -259,24 +259,34 @@ class PipelineBuilder():
         return task_request
 
     def finally_do(self, finally_action, *args, **kwargs):
-        task_type = _task_type_for(finally_action)
-        task_entry = _TaskEntry(_gen_id(), task_type, args, kwargs, parameters=self._get_defaults(finally_action), is_finally=True)
+        task_type, parameters = self._task_type_and_parameters_for(finally_action)
+        task_entry = _TaskEntry(_gen_id(), task_type, args, kwargs, parameters=parameters, is_finally=True)
         task_entry.set_parameters({'is_fruitful': False})
         self._pipeline.append(task_entry)
         return self
 
     def to_pipeline(self):
-        error = self.validate()
-        if error:
-            raise ValueError(f'Invalid pipeline: {error}')
+        self.validate()
         return _Pipeline(self._pipeline)
 
     def validate(self):
+
+        errors = []
+
+        for entry in self._pipeline:
+            entry.validate(errors)
+
         finally_tasks = [task for task in self._pipeline if isinstance(task, _TaskEntry) and task.is_finally]
         if len(finally_tasks) > 1:
-            return 'Cannot have more than one "finally_do" method.'
+            errors.append('Cannot have more than one "finally_do" method')
         if len(finally_tasks) == 1 and finally_tasks[0] != self._pipeline[-1]:
-            return 'finally_do must be called at the end of a pipeline'
+            errors.append('"finally_do" must be called at the end of a pipeline')
+        
+        if any(errors):
+            error = ', '.join(errors)
+            raise ValueError(f'Invalid pipeline: {error}')
+
+        return self
 
     def to_proto(self, serialiser) -> Pipeline:
         pipeline = Pipeline(entries=[p.to_proto(serialiser) for p in self._pipeline])
@@ -295,8 +305,12 @@ class PipelineBuilder():
         return PipelineBuilder(pipeline)
 
     @staticmethod
-    def _get_defaults(fun):
+    def _task_type_and_parameters_for(fun):
         try:
-            return fun.defaults()
+            parameters = fun.defaults()
+            module_name = parameters.get('module_name', None)
+            task_type = _task_type_for(fun, module_name)
+
+            return task_type, parameters
         except AttributeError:
             raise AttributeError(f'Function {fun.__module__}.{fun.__name__} should be decorated with tasks.bind')

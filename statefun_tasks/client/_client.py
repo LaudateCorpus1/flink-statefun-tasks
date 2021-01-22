@@ -1,14 +1,13 @@
-from ._types import TaskError
 from statefun_tasks import TaskRequest, TaskResult, TaskException, DefaultSerialiser, PipelineBuilder
+from statefun_tasks.client import TaskError
 
 from google.protobuf.any_pb2 import Any
-from kafka.errors import NoBrokersAvailable
 from kafka import KafkaProducer, KafkaConsumer, TopicPartition
 
 import logging
+import socket
 from uuid import uuid4
 from threading import Thread
-from typing import List
 import asyncio
 from concurrent.futures import Future
 
@@ -16,13 +15,14 @@ _log = logging.getLogger('FlinkTasks')
 
 
 class FlinkTasksClient(object):
-    def __init__(self, kafka_broker_url, topic, reply_topic, serialiser=None):
+    
+    def __init__(self, kafka_broker_url, request_topic, reply_topic, group_id=None, serialiser=None):
         self._kafka_broker_url = kafka_broker_url
         self._requests = {}
 
-        self._topic = topic
+        self._request_topic = request_topic
         self._reply_topic = reply_topic
-        self._group_id = f'{self._reply_topic}.{str(uuid4())}'  # unique for instance
+        self._group_id = group_id
         self._serialiser = serialiser if serialiser is not None else DefaultSerialiser()
 
         self._producer = KafkaProducer(bootstrap_servers=[kafka_broker_url])
@@ -30,7 +30,7 @@ class FlinkTasksClient(object):
         self._consumer = KafkaConsumer(
             self._reply_topic,
             bootstrap_servers=[self._kafka_broker_url],
-            auto_offset_reset='latest',
+            auto_offset_reset='earliest',
             group_id=self._group_id)
 
         self._consumer_thread = Thread(target=self._consume, args=())
@@ -60,7 +60,7 @@ class FlinkTasksClient(object):
         key = task_request.id.encode('utf-8')
         val = task_request.SerializeToString()
 
-        topic = self._topic if topic is None else topic
+        topic = self._request_topic if topic is None else topic
         self._producer.send(topic=topic, key=key, value=val)
         self._producer.flush()
 
@@ -70,6 +70,9 @@ class FlinkTasksClient(object):
         while True:
             try:
                 for message in self._consumer:
+
+                    _log.info(f'Message received - {message}')
+
                     any = Any()
                     any.ParseFromString(message.value)
 
@@ -79,7 +82,7 @@ class FlinkTasksClient(object):
                         self._return_result(any)
 
             except Exception as ex:
-                _log.warning(f"Exception in consumer thread - {ex}", exc_info=ex)
+                _log.warning(f'Exception in consumer thread - {ex}', exc_info=ex)
 
     def _return_result(self, any: Any):
         task_result = TaskResult()
@@ -113,3 +116,19 @@ class FlinkTasksClient(object):
                 future.set_exception(TaskError(task_exception))
             except Exception as ex:
                 future.set_exception(ex)
+
+
+class FlinkTasksClientFactory():
+    __clients = {}
+
+    @staticmethod
+    def get_client(kafka_broker_url, request_topic, reply_topic_prefix, serialiser=None) -> FlinkTasksClient:
+        key = f'{kafka_broker_url}.{request_topic}.{reply_topic_prefix}'
+
+        if key not in FlinkTasksClientFactory.__clients:
+
+            reply_topic = f'{reply_topic_prefix}.{socket.gethostname()}.{str(uuid4())}'
+            client = FlinkTasksClient(kafka_broker_url, request_topic, reply_topic, serialiser=serialiser)
+            FlinkTasksClientFactory.__clients[key] = client
+
+        return FlinkTasksClientFactory.__clients[key]
